@@ -1260,8 +1260,8 @@ SrsGb28181RtmpMuxer::SrsGb28181RtmpMuxer(SrsGb28181Manger* c, std::string id, bo
     ((SrsSTCoroutine*)trd)->set_stack_size(1 << 18);
     
     sdk = NULL;
-    vjitter = new SrsRtspJitter();
-    ajitter = new SrsRtspJitter();
+    vjitter = new SrsRtpTimeJitter();
+    ajitter = new SrsRtpTimeJitter();
     
     avc = new SrsRawH264Stream();
     aac = new SrsRawAacStream();
@@ -1284,8 +1284,8 @@ SrsGb28181RtmpMuxer::SrsGb28181RtmpMuxer(SrsGb28181Manger* c, std::string id, bo
     source = NULL;
     source_publish = true;
 
-    jitter_buffer = new SrsPsJitterBuffer(id);
-    jitter_buffer_audio = new SrsPsJitterBuffer(id);
+    jitter_buffer = new SrsRtpJitterBuffer(id);
+    jitter_buffer_audio = new SrsRtpJitterBuffer(id);
 
     ps_buflen = 0;
     ps_buffer = NULL;
@@ -1414,7 +1414,7 @@ srs_error_t SrsGb28181RtmpMuxer::initialize(SrsServer *s, SrsRequest* r)
     srs_error_t err = srs_success;
 
     if (!jitter_buffer) {
-        jitter_buffer = new SrsPsJitterBuffer(channel_id);
+        jitter_buffer = new SrsRtpJitterBuffer(channel_id);
     }
 
     jitter_buffer->SetDecodeErrorMode(kSelectiveErrors);
@@ -1422,7 +1422,7 @@ srs_error_t SrsGb28181RtmpMuxer::initialize(SrsServer *s, SrsRequest* r)
     jitter_buffer->SetNackSettings(250, 450, 0);
 
     if (!jitter_buffer_audio) {
-        jitter_buffer_audio = new SrsPsJitterBuffer(channel_id);
+        jitter_buffer_audio = new SrsRtpJitterBuffer(channel_id);
     }
 
     jitter_buffer_audio->SetDecodeErrorMode(kSelectiveErrors);
@@ -1458,6 +1458,7 @@ srs_error_t SrsGb28181RtmpMuxer::do_cycle()
     send_rtmp_stream_time = srs_get_system_time();
     uint32_t cur_timestamp = 0;
     int buffer_size = 0;
+    bool keyframe = false;
            
     //consume ps stream, and check status
     while (true) {
@@ -1472,7 +1473,7 @@ srs_error_t SrsGb28181RtmpMuxer::do_cycle()
 
         if (config.jitterbuffer_enable){
             if(jitter_buffer->FoundFrame(cur_timestamp)){
-                jitter_buffer->GetPsFrame(&ps_buffer, ps_buflen, buffer_size, cur_timestamp);
+                jitter_buffer->GetFrame(&ps_buffer, ps_buflen, buffer_size, keyframe, cur_timestamp);
             
                 if (buffer_size > 0){
                     if ((err = ps_demixer->on_ps_stream(ps_buffer, buffer_size, cur_timestamp, 0)) != srs_success){
@@ -1483,7 +1484,7 @@ srs_error_t SrsGb28181RtmpMuxer::do_cycle()
             }
 
             if(jitter_buffer_audio->FoundFrame(cur_timestamp)){
-                jitter_buffer_audio->GetPsFrame(&ps_buffer_audio, ps_buflen_auido, buffer_size, cur_timestamp);
+                jitter_buffer_audio->GetFrame(&ps_buffer_audio, ps_buflen_auido, buffer_size, keyframe, cur_timestamp);
             
                 if (buffer_size > 0){
                     if ((err = ps_demixer->on_ps_stream(ps_buffer_audio, buffer_size, cur_timestamp, 0)) != srs_success){
@@ -1600,10 +1601,12 @@ void SrsGb28181RtmpMuxer::insert_jitterbuffer(SrsPsRtpPacket *pkt)
     //otherwise audio uses jitter_buffer_audio, and video uses jitter_buffer
     if (av_same_ts){
         pkt->marker = false;
-        jitter_buffer->InsertPacket(*pkt, pkt->payload->bytes(), pkt->payload->length(), NULL);
+        jitter_buffer->InsertPacket(pkt->sequence_number, pkt->timestamp, pkt->marker, 
+                pkt->payload->bytes(), pkt->payload->length(), NULL);
         ps_rtp_video_ts = pkt->timestamp;
     }else {
-        jitter_buffer_audio->InsertPacket(*pkt, pkt->payload->bytes(), pkt->payload->length(), NULL);
+        jitter_buffer_audio->InsertPacket(pkt->sequence_number, pkt->timestamp, pkt->marker,
+                pkt->payload->bytes(), pkt->payload->length(), NULL);
     }
  
     //srs_cond_signal(wait_ps_queue);
@@ -1771,14 +1774,8 @@ srs_error_t SrsGb28181RtmpMuxer::write_h264_ipb_frame2(char *frame, int frame_si
 
         //0001xxxxxxxxxx
         //xxxx0001xxxxxxx
-        uint32_t naluLen = size - cur_pos;
-        char *p = (char*)&naluLen;
-                    
-        video_data[cur_pos] = p[3];
-        video_data[cur_pos+1] = p[2];
-        video_data[cur_pos+2] = p[1];
-        video_data[cur_pos+3] = p[0];
-
+        uint32_t naluLen = size - cur_pos - 4;
+        
         char *frame = video_data + cur_pos + 4;
         int frame_size = naluLen;
 
@@ -1797,13 +1794,7 @@ srs_error_t SrsGb28181RtmpMuxer::write_h264_ipb_frame2(char *frame, int frame_si
             //0001xxxxxxxx0001xxxxxxxx0001xxxxxxxxx
             //xxxxxxxxxxxx0001xxxxxxxx0001xxxxxxxxx
             uint32_t naluLen = cur_pos - pre_pos - 4;
-            char *p = (char*)&naluLen;
-                        
-            video_data[pre_pos] = p[3];
-            video_data[pre_pos+1] = p[2];
-            video_data[pre_pos+2] = p[1];
-            video_data[pre_pos+3] = p[0];
-
+            
             char *frame = video_data + pre_pos + 4;
             int frame_size = naluLen;
 
@@ -1816,13 +1807,7 @@ srs_error_t SrsGb28181RtmpMuxer::write_h264_ipb_frame2(char *frame, int frame_si
         if (first_pos != pre_pos){
 
             uint32_t naluLen = size - pre_pos - 4;
-            char *p = (char*)&naluLen;
-                        
-            video_data[pre_pos] = p[3];
-            video_data[pre_pos+1] = p[2];
-            video_data[pre_pos+2] = p[1];
-            video_data[pre_pos+3] = p[0];
-
+            
             char *frame = video_data + pre_pos + 4;
             int frame_size = naluLen;
 
@@ -2167,6 +2152,9 @@ SrsGb28181StreamChannel::SrsGb28181StreamChannel(){
     rtp_peer_port = 0;
     rtp_peer_ip = "";
     rtmp_url = "";
+    flv_url = "";
+    hls_url = "";
+    webrtc_url = "";
     recv_time = 0;
     recv_time_str = "";
 }
@@ -2191,6 +2179,9 @@ void SrsGb28181StreamChannel::copy(const SrsGb28181StreamChannel *s){
     rtp_peer_port = s->get_rtp_peer_port();
 
     rtmp_url = s->get_rtmp_url();
+    flv_url = s->get_flv_url();
+    hls_url = s->get_hls_url();
+    webrtc_url = s->get_webrtc_url();
     
     recv_time_str = s->get_recv_time_str();
     recv_time = s->get_recv_time();
@@ -2205,6 +2196,9 @@ void SrsGb28181StreamChannel::dumps(SrsJsonObject* obj)
     obj->set("app", SrsJsonAny::str(app.c_str()));
     obj->set("stream", SrsJsonAny::str(stream.c_str()));
     obj->set("rtmp_url", SrsJsonAny::str(rtmp_url.c_str()));
+    obj->set("flv_url", SrsJsonAny::str(flv_url.c_str()));
+    obj->set("hls_url", SrsJsonAny::str(hls_url.c_str()));
+    obj->set("webrtc_url", SrsJsonAny::str(webrtc_url.c_str()));
    
     obj->set("ssrc", SrsJsonAny::integer(ssrc));
     obj->set("rtp_port", SrsJsonAny::integer(rtp_port));
@@ -2298,7 +2292,7 @@ uint32_t SrsGb28181Manger::generate_ssrc(std::string id)
     //gb28181 live ssrc max value 0999999999(3B9AC9FF)  
     //gb28181 vod ssrc max value 1999999999(773593FF)
     uint8_t  index = uint8_t(rand() % (0x0F - 0x01 + 1) + 0x01);
-    uint32_t ssrc = 0x2FFFF00 & (hash_code(id) << 8) | index;
+    uint32_t ssrc = ((0x2FFFF00) & (hash_code(id) << 8)) | index;
     //uint32_t ssrc = 0x00FFFFFF & (hash_code(id));
     srs_trace("gb28181: generate ssrc id=%s, ssrc=%u", id.c_str(), ssrc);
     return  ssrc;
@@ -2599,7 +2593,21 @@ srs_error_t SrsGb28181Manger::create_stream_channel(SrsGb28181StreamChannel *cha
         channel->set_rtmp_port(rtmp_port);
         channel->set_ip(config->host);
         std::string play_url = srs_generate_rtmp_url(config->host, rtmp_port, "", "", app, stream_name, "");
+        
+        std::string flv_url = srs_string_replace(play_url, "rtmp://", "http://");
+        std::stringstream port;
+        port << ":" << rtmp_port;
+        flv_url = srs_string_replace(flv_url, port.str(), ":"+_srs_config->get_http_stream_listen());
+        std::string hls_url = flv_url + ".m3u8";
+        flv_url = flv_url + ".flv";
+     
+        std::string webrtc_url = srs_string_replace(play_url, "rtmp://", "webrtc://");
+        webrtc_url = srs_string_replace(webrtc_url, port.str(), ":"+_srs_config->get_http_api_listen());
+
         channel->set_rtmp_url(play_url);
+        channel->set_flv_url(flv_url);
+        channel->set_hls_url(hls_url);
+        channel->set_webrtc_url(webrtc_url);
 
         request.app = app;
         request.stream = stream_name;
@@ -2876,7 +2884,6 @@ srs_error_t SrsGb28181Conn::do_cycle()
 
 		nb_read = nb_read + leftDataLength;
 		
-		length;
 		pp = (char*)&length;
 		p = &(mbuffer[0]);
 		pp[1] = *p++;
